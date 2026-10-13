@@ -10,6 +10,13 @@
 
 可复用的字库文件与生成的字库源码放在 `fonts/`。
 
+| 文件 | 覆盖范围与集成方式 | 来源与许可 |
+| --- | --- | --- |
+| [`fonts/antonym_font_16.c`](fonts/antonym_font_16.c) | LVGL 16 px、4 bpp、未压缩的应用专用子集。覆盖可打印 ASCII（`0x20-0x7E`）以及 `main/main.c` 和 `main/antonym_game.c` 实际使用的 79 个非 ASCII 码点；以 `antonym_font_16` 编入 `main` 组件。 | 使用 `lv_font_conv` 1.5.3 从 Adobe Source Han Sans CN Regular 2.005R 生成。源字体采用 SIL Open Font License 1.1，见 [`fonts/LICENSE-SourceHanSans.txt`](fonts/LICENSE-SourceHanSans.txt)。 |
+| [`fonts/antonym_prompt_font_28.c`](fonts/antonym_prompt_font_28.c) | LVGL 28 px、4 bpp、未压缩的十个题目字子集，用来让题目词形成明显的视觉层级；以 `antonym_prompt_font_28` 编入 `main` 组件。 | 使用同一 Source Han Sans CN Regular 字体生成，采用 SIL Open Font License 1.1。 |
+
+可复现的转换命令及精确码点清单见英文版同节；中英文文档对应同一字体文件、版本和字符范围。
+
 - 命名要能反映字族、字重、字级与格式。
 - 记录来源、许可、字符范围、转换命令与目标放置路径。
 - 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。

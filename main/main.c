@@ -1,242 +1,254 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
-//
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
-#include "bsp_audio.h"
+#include "antonym_game.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
-#include "ui_pixel.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
 #include "lvgl.h"
 #include "esp_log.h"
-#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-static const char *TAG = "main";
+LV_FONT_DECLARE(antonym_font_16);
+LV_FONT_DECLARE(antonym_prompt_font_28);
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-};
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 #define INPUT_QUEUE_DEPTH 8
 
 typedef struct {
-    bsp_btn_t btn;
+    bsp_btn_t button;
     bsp_btn_ev_t event;
 } input_event_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
-
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
+static const char *TAG = "antonym_practice";
 static QueueHandle_t s_input_queue;
-static TaskHandle_t s_input_task;
-static volatile bool s_input_ready;
+static antonym_game_t s_game;
+static lv_obj_t *s_screen;
+static lv_obj_t *s_battery;
+static lv_obj_t *s_progress;
+static lv_obj_t *s_prompt_caption;
+static lv_obj_t *s_prompt;
+static lv_obj_t *s_options[2];
+static lv_obj_t *s_hint;
 
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
+static void set_cn_font(lv_obj_t *object)
+{
+    lv_obj_set_style_text_font(object, &antonym_font_16, 0);
+}
+
+static lv_obj_t *make_label(lv_obj_t *parent, const char *text, uint32_t color)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    set_cn_font(label);
+    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+    lv_label_set_text(label, text);
+    return label;
+}
+
+static void update_battery(void)
+{
+    int soc = bsp_battery_soc();
+    if (soc >= 0) {
+        lv_label_set_text_fmt(s_battery, "%d%%", soc);
+    } else {
+        lv_label_set_text(s_battery, "--%");
     }
 }
 
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+static void style_option(lv_obj_t *option, bool selected, bool answered, bool correct)
+{
+    uint32_t background = 0xFFFFFF;
+    uint32_t border = 0xB9C7D6;
+    uint32_t text = 0x253858;
 
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
+    if (answered && correct) {
+        background = 0xDDF8E7;
+        border = 0x2EA866;
+        text = 0x175C37;
+    } else if (answered && selected) {
+        background = 0xFFE2E0;
+        border = 0xE2544D;
+        text = 0x842922;
+    } else if (selected) {
+        background = 0xDDEBFF;
+        border = 0x3367D6;
+        text = 0x173F86;
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
-
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
+    lv_obj_set_style_bg_color(option, lv_color_hex(background), 0);
+    lv_obj_set_style_border_color(option, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(option, (selected || (answered && correct)) ? 3 : 2, 0);
+    lv_obj_set_style_shadow_color(option, lv_color_hex(border), 0);
+    lv_obj_set_style_shadow_width(option, selected ? 8 : 0, 0);
+    lv_obj_set_style_shadow_opa(option, selected ? LV_OPA_30 : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(option, 0), lv_color_hex(text), 0);
 }
 
-static void enter_menu(void) {
-    menu_build();
+static void show_question(void)
+{
+    const antonym_question_t *question = antonym_game_question(&s_game);
+    lv_label_set_text_fmt(s_progress, "%u / %u   %u分",
+        (unsigned)(s_game.question_index + 1),
+        (unsigned)ANTONYM_ROUND_LENGTH,
+        (unsigned)(s_game.score * 10));
+    lv_label_set_text(s_prompt_caption, "题目");
+    lv_obj_set_style_text_font(s_prompt, &antonym_prompt_font_28, 0);
+    lv_obj_set_style_text_color(s_prompt, lv_color_hex(0xFFF0A6), 0);
+    lv_label_set_text(s_prompt, question->word);
+    for (int i = 0; i < 2; ++i) {
+        lv_label_set_text(lv_obj_get_child(s_options[i], 0), question->options[i]);
+        style_option(s_options[i], i == s_game.selection, s_game.answered,
+            i == question->correct_option);
+    }
+    lv_label_set_text(s_hint, s_game.answered
+        ? (s_game.last_correct ? "答对啦！按确定继续" : "再想想，下次会更好！按确定继续")
+        : "选择反义词：上/下切换，确定作答");
 }
 
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
+static void show_result(void)
+{
+    lv_label_set_text(s_progress, "本轮完成");
+    lv_label_set_text(s_prompt_caption, "本轮");
+    lv_obj_set_style_text_font(s_prompt, &antonym_font_16, 0);
+    lv_obj_set_style_text_color(s_prompt, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text_fmt(s_prompt, "%u 分", (unsigned)(s_game.score * 10));
+    lv_label_set_text(lv_obj_get_child(s_options[0], 0),
+        s_game.score >= 8 ? "太棒了！" : "继续加油！");
+    lv_label_set_text(lv_obj_get_child(s_options[1], 0), "长按确定再来一轮");
+    style_option(s_options[0], true, false, false);
+    style_option(s_options[1], false, false, false);
+    lv_label_set_text(s_hint, "离线题库 · 不使用网络和 AI token");
 }
 
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
+static void refresh_ui(void)
+{
+    update_battery();
+    if (s_game.state == ANTONYM_GAME_RESULT) {
+        show_result();
+    } else {
+        show_question();
+    }
+}
 
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
-            }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
+static void build_ui(void)
+{
+    s_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_screen, lv_color_hex(0xF4F8FF), 0);
+    lv_obj_set_style_pad_all(s_screen, 0, 0);
+
+    lv_obj_t *header = lv_obj_create(s_screen);
+    lv_obj_set_size(header, 240, 48);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0x4467C4), 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_radius(header, 0, 0);
+
+    lv_obj_t *title = make_label(header, "反义词小课堂", 0xFFFFFF);
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, 4, 0);
+    s_battery = lv_label_create(header);
+    lv_obj_set_style_text_font(s_battery, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_battery, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(s_battery, LV_ALIGN_RIGHT_MID, -2, 0);
+
+    s_progress = make_label(s_screen, "", 0x526173);
+    lv_obj_align(s_progress, LV_ALIGN_TOP_MID, 0, 59);
+
+    lv_obj_t *question_card = lv_obj_create(s_screen);
+    lv_obj_set_size(question_card, 190, 65);
+    lv_obj_align(question_card, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_set_style_bg_color(question_card, lv_color_hex(0x5A4CC7), 0);
+    lv_obj_set_style_border_color(question_card, lv_color_hex(0x33279E), 0);
+    lv_obj_set_style_border_width(question_card, 3, 0);
+    lv_obj_set_style_radius(question_card, 14, 0);
+    lv_obj_set_style_pad_all(question_card, 0, 0);
+    s_prompt_caption = make_label(question_card, "题目", 0xDAD7FF);
+    lv_obj_align(s_prompt_caption, LV_ALIGN_TOP_MID, 0, 3);
+    s_prompt = make_label(question_card, "", 0xFFF0A6);
+    lv_obj_set_style_text_font(s_prompt, &antonym_prompt_font_28, 0);
+    lv_obj_align(s_prompt, LV_ALIGN_BOTTOM_MID, 0, -3);
+
+    for (int i = 0; i < 2; ++i) {
+        s_options[i] = lv_obj_create(s_screen);
+        lv_obj_set_size(s_options[i], 190, 48);
+        lv_obj_align(s_options[i], LV_ALIGN_TOP_MID, 0, 164 + i * 58);
+        lv_obj_set_style_radius(s_options[i], 12, 0);
+        lv_obj_set_style_pad_all(s_options[i], 0, 0);
+        lv_obj_t *label = make_label(s_options[i], "", 0x253858);
+        lv_obj_center(label);
+    }
+
+    s_hint = make_label(s_screen, "", 0x526173);
+    lv_obj_set_width(s_hint, 220);
+    lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    refresh_ui();
+    lv_screen_load(s_screen);
+}
+
+static void process_input(const input_event_t *input)
+{
+    if (input->event == BSP_BTN_LONG && input->button == BSP_BTN_OK) {
+        antonym_game_start(&s_game);
+    } else if (input->event == BSP_BTN_CLICK) {
+        if (input->button == BSP_BTN_UP) {
+            antonym_game_move(&s_game, -1);
+        } else if (input->button == BSP_BTN_DOWN) {
+            antonym_game_move(&s_game, 1);
+        } else if (input->button == BSP_BTN_OK) {
+            antonym_game_confirm(&s_game);
         }
+    } else {
         return;
     }
 
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
+    bsp_display_backlight(100);
+    if (bsp_lvgl_lock(250)) {
+        refresh_ui();
         bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
-        }
-        return;
     }
-    bsp_lvgl_unlock();
 }
 
-static void input_task(void *arg) {
+static void input_task(void *arg)
+{
     (void)arg;
     input_event_t input;
-    for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            process_input(&input);
-        }
+    while (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
+        process_input(&input);
     }
 }
 
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+static void on_key(bsp_btn_t button, bsp_btn_ev_t event, void *user)
+{
     (void)user;
-    if (!s_input_ready || !s_input_queue) return;
-    const input_event_t input = { .btn = btn, .event = ev };
+    if (!s_input_queue) {
+        return;
+    }
+    const input_event_t input = { .button = button, .event = event };
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
-    esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
-    if (wakeup != ESP_SLEEP_WAKEUP_UNDEFINED) {
-        ESP_LOGI(TAG, "休眠唤醒原因: %d", wakeup);
-    }
-
+void app_main(void)
+{
+    ESP_LOGI(TAG, "offline antonym practice starting");
     bsp_i2c_init();
-    bsp_i2c_scan();
-
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
-                      "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
-                 BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
+        ESP_LOGE(TAG, "display initialization failed");
         return;
     }
     bsp_display_backlight(100);
+    (void)bsp_battery_init();
 
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
-
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
-    if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
+    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
+    if (!s_input_queue ||
+        xTaskCreate(input_task, "antonym_input", 3072, NULL, 5, NULL) != pdPASS ||
+        bsp_button_init(on_key, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "input initialization failed");
+        return;
     }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
 
+    antonym_game_start(&s_game);
     if (bsp_lvgl_lock(1000)) {
-        enter_menu();
+        build_ui();
         bsp_lvgl_unlock();
-        s_input_ready = true;
     }
-
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
 }
