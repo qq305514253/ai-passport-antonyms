@@ -1,5 +1,5 @@
 <p align="right">
-  <strong>English</strong> · <a href="README.zh_CN.md">简体中文</a>
+  <strong>English</strong> · <a href="README.zh_CN.md">简体中文liqibag.com</a>
 </p>
 
 # Antonym Mini Classroom
